@@ -10,16 +10,94 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from uuid import uuid4
 
 import mujoco
-from control import TaskManager, build, queue_demo
+from control import CAMERAS, TaskManager, build, queue_demo
 
 MODEL_COMMIT = "98a70c569c4c1b6da467a20012f766ee1f8dc521"
 MODEL_DIR = Path(__file__).resolve().parent / "models" / "robotstudio_so101"
+
+
+class CameraViews:
+    """Two RGB streams from one physics state; rendering never steps physics.
+
+    capture(data) returns {camera_name: RGB uint8 array}. Call only on the
+    simulation thread. Each call captures both views at the same data.time.
+    """
+    def __init__(self, model, full_resolution=False, display=True):
+        self.model, self.display = model, display
+        self.renderers = {}
+        self.windows = []
+        self.cv2 = None
+        self.sizes = {name: (spec["width"], spec["height"])
+                      for name, spec in CAMERAS.items()}
+        if not full_resolution:
+            self.sizes["overhead_cam"] = (960, 540)
+        self.option = mujoco.MjvOption()
+        self.option.geomgroup[3:5] = 0  # Show the actual visual meshes, not collision proxies.
+
+    def __enter__(self):
+        try:
+            if self.display:
+                import cv2
+                self.cv2 = cv2
+            for name, (width, height) in self.sizes.items():
+                self.renderers[name] = mujoco.Renderer(self.model, height=height, width=width)
+                if self.display:
+                    self.cv2.namedWindow(name, self.cv2.WINDOW_NORMAL)
+                    self.windows.append(name)
+                    self.cv2.resizeWindow(name, min(width, 960), min(height, 540))
+            if self.display:
+                self.cv2.moveWindow("wrist_cam", 20, 40)
+                self.cv2.moveWindow("overhead_cam", 680, 40)
+            return self
+        except Exception:
+            self.close()
+            raise
+
+    def capture(self, data):
+        frames = {}
+        for name, renderer in self.renderers.items():
+            renderer.update_scene(data, camera=name, scene_option=self.option)
+            frames[name] = renderer.render().copy()
+        return frames
+
+    def show(self, data, phase):
+        # Check before imshow so closing a camera does not recreate its window.
+        try:
+            visible = all(self.cv2.getWindowProperty(name, self.cv2.WND_PROP_VISIBLE) >= 1
+                          for name in self.windows)
+        except self.cv2.error:
+            visible = False
+        if not visible:
+            return False
+        for name, rgb in self.capture(data).items():
+            frame = self.cv2.cvtColor(rgb, self.cv2.COLOR_RGB2BGR)
+            self.cv2.putText(frame, f"{name} | {data.time:.2f}s | {phase}", (12, 25),
+                             self.cv2.FONT_HERSHEY_SIMPLEX, .55, (255, 255, 255), 1,
+                             self.cv2.LINE_AA)
+            self.cv2.imshow(name, frame)
+        return self.cv2.waitKey(1) & 0xff != 27
+
+    def close(self):
+        for renderer in self.renderers.values():
+            renderer.close()
+        self.renderers.clear()
+        if self.cv2:
+            for name in self.windows:
+                try:
+                    self.cv2.destroyWindow(name)
+                except self.cv2.error:
+                    pass
+        self.windows.clear()
+
+    def __exit__(self, *exc):
+        self.close()
 
 
 def ensure_model():
@@ -185,9 +263,14 @@ def main():
     parser.add_argument("--manual", action="store_true", help="Start idle, waiting for API commands")
     parser.add_argument("--shifted", action="store_true", help="Use nearby alternative object and box positions")
     parser.add_argument("--headless", action="store_true")
+    parser.add_argument("--no-cameras", action="store_true", help="Show only the original 3D viewer")
+    parser.add_argument("--camera-fps", type=float, default=15., help="RGB preview update rate, 1-30 (default 15)")
+    parser.add_argument("--camera-full-res", action="store_true", help="Render overhead RGB at 1920x1080 instead of 960x540")
     parser.add_argument("--port", type=int, default=8765, help="Local API port; 0 disables HTTP")
     parser.add_argument("--log", type=Path, help="JSONL log path; default: logs/<timestamp>.jsonl")
     args = parser.parse_args()
+    if not math.isfinite(args.camera_fps) or not 1 <= args.camera_fps <= 30:
+        parser.error("--camera-fps must be between 1 and 30")
     if args.model is None:
         args.model = ensure_model()
     if not args.model.is_file():
@@ -219,7 +302,7 @@ def main():
                   "mode": "manual" if args.manual else "auto_demo"})
             if not args.manual:
                 queue_demo(hub)
-            print("SIMULATION ONLY | close window: stop", flush=True)
+            print("SIMULATION ONLY | close viewer/camera window: stop | ESC in RGB window: stop", flush=True)
             print("Left box = green (+Y); right box = purple (-Y). These names use the robot frame.", flush=True)
             completed_announced = False
 
@@ -249,7 +332,8 @@ def main():
             else:
                 import mujoco.viewer as viewer_module
 
-                with viewer_module.launch_passive(model, data) as viewer:
+                camera_context = nullcontext(None) if args.no_cameras else CameraViews(model, args.camera_full_res)
+                with camera_context as cameras, viewer_module.launch_passive(model, data) as viewer:
                     with viewer.lock():
                         viewer.cam.lookat[:] = [.17, 0., .10]
                         viewer.cam.distance = .78
@@ -257,12 +341,19 @@ def main():
                         viewer.cam.elevation = -35.
                     viewer.sync()
                     next_frame = time.perf_counter()
+                    next_camera = next_frame
+                    if cameras:
+                        print("RGB cameras: wrist follows gripper; overhead stays fixed. Ideal lenses, no depth.", flush=True)
                     while viewer.is_running():
                         started = time.perf_counter()
                         tick()
                         if started >= next_frame:
                             viewer.sync()
                             next_frame = started + .02
+                        if cameras and started >= next_camera:
+                            if not cameras.show(data, manager.active.phase if manager.active else "IDLE"):
+                                break
+                            next_camera = time.perf_counter() + 1. / args.camera_fps
                         time.sleep(max(0., model.opt.timestep - (time.perf_counter() - started)))
         finally:
             if manager.active:

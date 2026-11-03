@@ -12,6 +12,18 @@ BOX_FLOOR_Z = .004
 BOX_INNER = (.052, .032)
 BOX_WALL_TOP = .022
 
+# Ideal RGB cameras. Advertised FOV is treated as diagonal (not calibrated).
+CAMERAS = {
+    "wrist_cam": {"width": 640, "height": 480, "diagonal_fov": 120.},
+    "overhead_cam": {"width": 1920, "height": 1080, "diagonal_fov": 160.},
+}
+
+
+def camera_fovy(spec):
+    aspect = spec["width"] / spec["height"]
+    return float(np.rad2deg(2 * np.arctan(np.tan(np.deg2rad(spec["diagonal_fov"]) / 2)
+                                         / np.sqrt(1 + aspect * aspect))))
+
 
 def layout(shifted=False):
     objects = {
@@ -39,6 +51,20 @@ def build(model_path, shifted=False):
     root.find("actuator/position[@name='gripper']").set("forcerange", "-.30 .30")
     root.find("visual/scale").set("framelength", ".03")
     asset, world = root.find("asset"), root.find("worldbody")
+    # Reuse the upstream wrist camera and its physical mount; fixed world camera
+    # looks along -Z, with robot +X right and +Y up in the image.
+    wrist_camera = root.find(".//camera[@name='wrist_cam']")
+    if wrist_camera is None:
+        raise ValueError("The SO-101 model must include wrist_cam; use the pinned model")
+    wrist_camera.set("fovy", str(camera_fovy(CAMERAS["wrist_cam"])))
+    ET.SubElement(world, "camera", name="overhead_cam", mode="fixed",
+                  pos=".18 0 .45", xyaxes="1 0 0 0 1 0",
+                  fovy=str(camera_fovy(CAMERAS["overhead_cam"])))
+    visual_global = root.find("visual/global")
+    if visual_global is None:
+        visual_global = ET.SubElement(root.find("visual"), "global")
+    visual_global.set("offwidth", "1920")
+    visual_global.set("offheight", "1080")
     ET.SubElement(asset, "texture", name="grid", type="2d", builtin="checker", rgb1=".18 .22 .28", rgb2=".25 .30 .36", width="256", height="256")
     ET.SubElement(asset, "material", name="ground", texture="grid", texrepeat="20 20", texuniform="true")
     ET.SubElement(world, "geom", name="floor", type="plane", size="1 1 .05", material="ground")
