@@ -6,10 +6,7 @@ import math
 import sys
 import threading
 import time
-import urllib.request
-import xml.etree.ElementTree as ET
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -17,11 +14,8 @@ from pathlib import Path
 from uuid import uuid4
 
 import mujoco
-from control import CAMERAS, TaskManager, VisualTaskManager, build, queue_demo
-
-MODEL_COMMIT = "98a70c569c4c1b6da467a20012f766ee1f8dc521"
-MODEL_DIR = Path(__file__).resolve().parent / "models" / "robotstudio_so101"
-
+from control import TaskManager, VisualTaskManager, queue_demo
+from scene import CAMERAS, build, ensure_model
 
 class CameraViews:
     """Two RGB streams from one physics state; rendering never steps physics.
@@ -104,41 +98,6 @@ class CameraViews:
 
     def __exit__(self, *exc):
         self.close()
-
-
-def ensure_model():
-    """Fetch only the pinned SO-101 XML, meshes and upstream license."""
-    base = f"https://raw.githubusercontent.com/google-deepmind/mujoco_menagerie/{MODEL_COMMIT}/robotstudio_so101/"
-
-    def download(relative):
-        path = MODEL_DIR / relative
-        if path.is_file() and path.stat().st_size:
-            return
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_name(path.name + ".download")
-        try:
-            with urllib.request.urlopen(base + relative, timeout=60) as response:
-                content = response.read()
-            if not content:
-                raise OSError("Empty model download: " + relative)
-            temporary.write_bytes(content)
-            temporary.replace(path)
-        finally:
-            temporary.unlink(missing_ok=True)
-
-    download("so101.xml")
-    root = ET.parse(MODEL_DIR / "so101.xml").getroot()
-    files = ["scene.xml", "LICENSE"]
-    for mesh in root.findall("asset/mesh"):
-        name = mesh.attrib["file"]
-        if Path(name).name != name or "\\" in name:
-            raise ValueError("Unexpected mesh path in upstream model")
-        files.append("assets/" + name)
-    if any(not (MODEL_DIR / name).is_file() for name in files):
-        print("Downloading pinned SO-101 model (first run)...", flush=True)
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        list(pool.map(download, files))
-    return MODEL_DIR / "scene.xml"
 
 
 # Command interface
@@ -297,7 +256,10 @@ def main():
     log_lock = threading.Lock()
     server = None
     with ExitStack() as resources, log_path.open("w", encoding="utf-8") as log_file:
+        execution_start = time.perf_counter()
+
         def emit(event):
+            event = {"sim_time": round(data.time, 3), "wall_elapsed_s": round(time.perf_counter() - execution_start, 3), **event}
             line = json.dumps(event, ensure_ascii=True)
             with log_lock:
                 print(line, flush=True)
@@ -321,6 +283,7 @@ def main():
                   "log": str(log_path), "layout": "shifted" if args.shifted else "default",
                   "mode": "manual" if args.manual else "auto_demo",
                   "control_source": "simulator_state" if args.state_control else "rgb_plane_geometry"})
+            execution_start = time.perf_counter()
             if not args.manual:
                 queue_demo(hub)
             print("SIMULATION ONLY | close viewer/camera window: stop | ESC in RGB window: stop", flush=True)

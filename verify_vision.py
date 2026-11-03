@@ -8,8 +8,9 @@ import json
 import mujoco
 import numpy as np
 
-from control import OBSERVE_Q, PickPlaceTask, Robot, VisualTaskManager, build, contained, queue_demo
-from run_demo import CameraViews, CommandHub, ensure_model
+from control import OBSERVE_Q, PickPlaceTask, Robot, VisualTaskManager, contained, queue_demo
+from run_demo import CameraViews, CommandHub
+from scene import build, ensure_model
 from vision import VisionError, VisionSystem
 
 

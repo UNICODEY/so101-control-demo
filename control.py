@@ -1,92 +1,8 @@
-"""SO-101 scene, inverse kinematics and feedback-driven pick-and-place control."""
-from pathlib import Path
-import xml.etree.ElementTree as ET
-
+"""Inverse kinematics, feedback-driven arm control and pick-and-place tasks."""
 import mujoco
 import numpy as np
 
-
-# Scene
-HALF = .015
-BOX_FLOOR_Z = .004
-BOX_INNER = (.052, .032)
-BOX_WALL_TOP = .022
-
-# Ideal RGB cameras. Advertised FOV is treated as diagonal (not calibrated).
-CAMERAS = {
-    "wrist_cam": {"width": 640, "height": 480, "diagonal_fov": 120.},
-    "overhead_cam": {"width": 1920, "height": 1080, "diagonal_fov": 160.},
-}
-
-
-def camera_fovy(spec):
-    aspect = spec["width"] / spec["height"]
-    return float(np.rad2deg(2 * np.arctan(np.tan(np.deg2rad(spec["diagonal_fov"]) / 2)
-                                         / np.sqrt(1 + aspect * aspect))))
-
-
-def layout(shifted=False):
-    objects = {
-        "red_cube": {"xy": [.23, -.06], "rgba": ".9 .12 .08 1"},
-        "blue_cube": {"xy": [.25, 0.], "rgba": ".12 .35 .95 1"},
-        "yellow_cube": {"xy": [.23, .06], "rgba": ".95 .75 .08 1"},
-    }
-    boxes = {
-        "left_box": {"xy": [.16, .12], "rgba": ".15 .65 .35 1"},
-        "right_box": {"xy": [.16, -.12], "rgba": ".65 .25 .65 1"},
-    }
-    if shifted:
-        for i, obj in enumerate(objects.values()):
-            obj["xy"][0] -= .005
-            obj["xy"][1] += .004 if i != 1 else -.004
-        for box in boxes.values():
-            box["xy"][0] += .005
-    return objects, boxes
-
-
-def build(model_path, shifted=False):
-    directory = Path(model_path).resolve().parent
-    root = ET.parse(directory / "so101.xml").getroot()
-    root.find("compiler").set("meshdir", str(directory / "assets"))
-    root.find("actuator/position[@name='gripper']").set("forcerange", "-.30 .30")
-    root.find("visual/scale").set("framelength", ".03")
-    asset, world = root.find("asset"), root.find("worldbody")
-    # Reuse the upstream wrist camera and its physical mount; fixed world camera
-    # looks along -Z, with robot +X right and +Y up in the image.
-    wrist_camera = root.find(".//camera[@name='wrist_cam']")
-    if wrist_camera is None:
-        raise ValueError("The SO-101 model must include wrist_cam; use the pinned model")
-    wrist_camera.set("fovy", str(camera_fovy(CAMERAS["wrist_cam"])))
-    ET.SubElement(world, "camera", name="overhead_cam", mode="fixed",
-                  pos=".18 0 .45", xyaxes="1 0 0 0 1 0",
-                  fovy=str(camera_fovy(CAMERAS["overhead_cam"])))
-    visual_global = root.find("visual/global")
-    if visual_global is None:
-        visual_global = ET.SubElement(root.find("visual"), "global")
-    visual_global.set("offwidth", "1920")
-    visual_global.set("offheight", "1080")
-    ET.SubElement(asset, "texture", name="grid", type="2d", builtin="checker", rgb1=".18 .22 .28", rgb2=".25 .30 .36", width="256", height="256")
-    ET.SubElement(asset, "material", name="ground", texture="grid", texrepeat="20 20", texuniform="true")
-    ET.SubElement(world, "geom", name="floor", type="plane", size="1 1 .05", material="ground")
-    ET.SubElement(world, "light", pos=".3 -.4 1.5", dir="0 0 -1", directional="true")
-    ET.SubElement(root.find(".//body[@name='gripper']"), "site", name="tcp", pos=".007 0 -.09", size=".002", rgba="0 .8 1 1", group="3")
-    objects, boxes = layout(shifted)
-    for name, spec in objects.items():
-        x, y = spec["xy"]
-        body = ET.SubElement(world, "body", name=name, pos=f"{x} {y} {HALF}")
-        ET.SubElement(body, "freejoint", name=name + "_free")
-        ET.SubElement(body, "geom", name=name + "_geom", type="box", size=".015 .015 .015", mass=".025", rgba=spec["rgba"], friction="1 .005 .0001", condim="6", solref=".01 1")
-    for name, spec in boxes.items():
-        x, y = spec["xy"]
-        body = ET.SubElement(world, "body", name=name, pos=f"{x} {y} 0")
-        common = dict(type="box", rgba=spec["rgba"], friction="1 .005 .0001")
-        ET.SubElement(body, "geom", name=name + "_bottom", pos="0 0 .002", size=".055 .035 .002", **common)
-        ET.SubElement(body, "geom", name=name + "_wall_xp", pos=".0535 0 .013", size=".0015 .035 .009", **common)
-        ET.SubElement(body, "geom", name=name + "_wall_xm", pos="-.0535 0 .013", size=".0015 .035 .009", **common)
-        ET.SubElement(body, "geom", name=name + "_wall_yp", pos="0 .0335 .013", size=".052 .0015 .009", **common)
-        ET.SubElement(body, "geom", name=name + "_wall_ym", pos="0 -.0335 .013", size=".052 .0015 .009", **common)
-    model = mujoco.MjModel.from_xml_string(ET.tostring(root, encoding="unicode"))
-    return model, objects, boxes
+from scene import HALF, BOX_FLOOR_Z, BOX_INNER
 
 
 def contained(data, object_id, box):
@@ -147,6 +63,26 @@ class Robot:
 OPEN = .80
 CLOSE = -.05
 HOVER = .075
+# Reference joint speeds (rad/s), not hardware motor ratings.
+MOTION = dict(travel=2., loaded=1.5, contact=.9, gripper=3., minimum=.20, settle=.10)
+
+
+def trajectory_duration(points, phase):
+    profile = MOTION
+    arm_speed = (profile["contact"] if phase in ("DESCEND", "LOWER") else
+                 profile["loaded"] if phase in ("LIFT", "TRANSFER") else profile["travel"])
+    slopes = np.max(np.abs(np.diff(points, axis=0)), axis=0) * (len(points) - 1)
+    limits = np.array([arm_speed] * 5 + [profile["gripper"]])
+    return max(profile["minimum"], 1.5 * float(np.max(slopes / limits)))
+
+
+def settle_duration(phase):
+    if phase == "VERIFY":
+        return 1.  # Preserve the full visual placement verification.
+    if phase == "GRASP":
+        return .20
+    return MOTION["settle"]
+
 OBSERVE_Q = np.array([-1.2, 0., 0., 0., 0., OPEN])
 
 
@@ -210,8 +146,7 @@ class PickPlaceTask:
                 points = np.asarray(points)
             if np.any(points < robot.limits[:, 0]) or np.any(points > robot.limits[:, 1]):
                 raise ValueError(f"Joint limits exceeded in {name}")
-            slope = float(np.max(np.abs(np.diff(points, axis=0)))) * (len(points) - 1)
-            duration = max(2., 1.5 * slope / .30)
+            duration = trajectory_duration(points, name)
             self.plans.append((name, xyz, points, 0. if name == "VERIFY" else duration))
             previous_xyz, previous_q = xyz, points[-1]
         self.index = -1
@@ -339,7 +274,7 @@ class PickPlaceTask:
             ready &= self.d.body(self.object_id).xmat.reshape(3, 3)[2, 2] > .95
             ready &= contained(self.d, self.object_id, self.box) if self.box else abs(cube[2] - HALF) < .003
         self.stable = self.stable + dt if ready else 0.
-        if self.stable >= (1. if self.phase == "VERIFY" else .35):
+        if self.stable >= settle_duration(self.phase):
             if self.phase == "LIFT":
                 self.lift_verified = True
             self.event(self.command["id"], "RUNNING", phase=self.phase, phase_result="SUCCESS", details=self.details())
@@ -426,7 +361,9 @@ class ObserveMotion:
     def __init__(self, data, robot, command):
         self.d, self.robot, self.command = data, robot, command
         self.start = data.ctrl[robot.a].copy()
-        self.duration = max(2., 1.5 * np.max(np.abs(OBSERVE_Q - self.start)) / .30)
+        self.duration = trajectory_duration(np.array([self.start, OBSERVE_Q]), "OBSERVE")
+        if np.max(np.abs(data.qpos[robot.q] - OBSERVE_Q)) < .01:
+            self.duration = 0.
         self.elapsed = self.stable = 0.
         self.done = self.failed = False
         self.reason = ""
@@ -437,12 +374,12 @@ class ObserveMotion:
             self.failed, self.reason = True, "NUMERICAL_ERROR"
             return
         self.elapsed += dt
-        u = min(1., self.elapsed / self.duration)
+        u = min(1., self.elapsed / self.duration) if self.duration else 1.
         self.d.ctrl[self.robot.a] = self.start + (3*u*u - 2*u*u*u) * (OBSERVE_Q - self.start)
         ready = (u == 1 and np.max(np.abs(self.d.qpos[self.robot.q] - OBSERVE_Q)) < .03
                  and np.max(np.abs(self.d.qvel[self.robot.v])) < .1)
         self.stable = self.stable + dt if ready else 0.
-        self.done = self.stable >= .35
+        self.done = self.stable >= settle_duration("OBSERVE")
         if not self.done and self.elapsed > self.duration + 5:
             self.failed, self.reason = True, "OBSERVE_MOTION_TIMEOUT"
 
