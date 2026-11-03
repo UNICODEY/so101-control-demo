@@ -10,14 +10,14 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import nullcontext
+from contextlib import ExitStack
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from uuid import uuid4
 
 import mujoco
-from control import CAMERAS, TaskManager, build, queue_demo
+from control import CAMERAS, TaskManager, VisualTaskManager, build, queue_demo
 
 MODEL_COMMIT = "98a70c569c4c1b6da467a20012f766ee1f8dc521"
 MODEL_DIR = Path(__file__).resolve().parent / "models" / "robotstudio_so101"
@@ -67,7 +67,7 @@ class CameraViews:
             frames[name] = renderer.render().copy()
         return frames
 
-    def show(self, data, phase):
+    def show(self, data, phase, vision=None):
         # Check before imshow so closing a camera does not recreate its window.
         try:
             visible = all(self.cv2.getWindowProperty(name, self.cv2.WND_PROP_VISIBLE) >= 1
@@ -78,6 +78,12 @@ class CameraViews:
             return False
         for name, rgb in self.capture(data).items():
             frame = self.cv2.cvtColor(rgb, self.cv2.COLOR_RGB2BGR)
+            if name == "overhead_cam" and vision and 0 <= data.time - vision.stamp < .3:
+                for object_id, detection in {**vision.objects, **vision.boxes}.items():
+                    x, y, width, height = detection["bbox"]
+                    self.cv2.rectangle(frame, (x, y), (x + width, y + height), (0, 255, 0), 2)
+                    self.cv2.putText(frame, object_id, (x, y - 5), self.cv2.FONT_HERSHEY_SIMPLEX,
+                                     .5, (255, 255, 255), 1, self.cv2.LINE_AA)
             self.cv2.putText(frame, f"{name} | {data.time:.2f}s | {phase}", (12, 25),
                              self.cv2.FONT_HERSHEY_SIMPLEX, .55, (255, 255, 255), 1,
                              self.cv2.LINE_AA)
@@ -198,6 +204,11 @@ class CommandHub:
     def event(self, task_id, status, **fields):
         with self.lock:
             record = self.records[str(task_id)]
+            if fields.get("phase") != record.get("phase"):
+                record.pop("phase_result", None)
+            if status in ("RUNNING", "PLANNING", "SUCCESS") and "error" not in fields:
+                for key in ("error", "reason", "recoverable"):
+                    record.pop(key, None)
             record.update(status=status, **fields)
             self.emit({"id": str(task_id), "status": status, **fields})
 
@@ -263,6 +274,7 @@ def main():
     parser.add_argument("--manual", action="store_true", help="Start idle, waiting for API commands")
     parser.add_argument("--shifted", action="store_true", help="Use nearby alternative object and box positions")
     parser.add_argument("--headless", action="store_true")
+    parser.add_argument("--state-control", action="store_true", help="Explicit legacy comparison: use simulator object coordinates instead of RGB")
     parser.add_argument("--no-cameras", action="store_true", help="Show only the original 3D viewer")
     parser.add_argument("--camera-fps", type=float, default=15., help="RGB preview update rate, 1-30 (default 15)")
     parser.add_argument("--camera-full-res", action="store_true", help="Render overhead RGB at 1920x1080 instead of 960x540")
@@ -284,7 +296,7 @@ def main():
     mujoco.mj_forward(model, data)
     log_lock = threading.Lock()
     server = None
-    with log_path.open("w", encoding="utf-8") as log_file:
+    with ExitStack() as resources, log_path.open("w", encoding="utf-8") as log_file:
         def emit(event):
             line = json.dumps(event, ensure_ascii=True)
             with log_lock:
@@ -293,13 +305,22 @@ def main():
                 log_file.flush()
 
         hub = CommandHub(objects, boxes, emit)
-        manager = TaskManager(model, data, objects, boxes, hub)
+        cameras = None
+        if not args.state_control or (not args.headless and not args.no_cameras):
+            cameras = resources.enter_context(CameraViews(model, not args.state_control or args.camera_full_res,
+                                                          display=not args.headless and not args.no_cameras))
+        if args.state_control:
+            manager = TaskManager(model, data, objects, boxes, hub)
+        else:
+            from vision import VisionSystem
+            manager = VisualTaskManager(model, data, objects, boxes, hub, VisionSystem(model, cameras))
         try:
             if args.port:
                 server = serve(hub, args.port)
             emit({"event": "READY", "api": f"http://127.0.0.1:{args.port}" if args.port else None,
                   "log": str(log_path), "layout": "shifted" if args.shifted else "default",
-                  "mode": "manual" if args.manual else "auto_demo"})
+                  "mode": "manual" if args.manual else "auto_demo",
+                  "control_source": "simulator_state" if args.state_control else "rgb_plane_geometry"})
             if not args.manual:
                 queue_demo(hub)
             print("SIMULATION ONLY | close viewer/camera window: stop | ESC in RGB window: stop", flush=True)
@@ -332,8 +353,7 @@ def main():
             else:
                 import mujoco.viewer as viewer_module
 
-                camera_context = nullcontext(None) if args.no_cameras else CameraViews(model, args.camera_full_res)
-                with camera_context as cameras, viewer_module.launch_passive(model, data) as viewer:
+                with viewer_module.launch_passive(model, data) as viewer:
                     with viewer.lock():
                         viewer.cam.lookat[:] = [.17, 0., .10]
                         viewer.cam.distance = .78
@@ -350,8 +370,9 @@ def main():
                         if started >= next_frame:
                             viewer.sync()
                             next_frame = started + .02
-                        if cameras and started >= next_camera:
-                            if not cameras.show(data, manager.active.phase if manager.active else "IDLE"):
+                        if cameras and cameras.display and started >= next_camera:
+                            if not cameras.show(data, manager.active.phase if manager.active else "IDLE",
+                                                getattr(manager, "vision", None)):
                                 break
                             next_camera = time.perf_counter() + 1. / args.camera_fps
                         time.sleep(max(0., model.opt.timestep - (time.perf_counter() - started)))

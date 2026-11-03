@@ -115,6 +115,11 @@ class Robot:
             raise ValueError("Unexpected model actuator mapping")
         self.ik_data = mujoco.MjData(model)  # Never used as the live physics state.
 
+    def tcp_at(self, q):
+        self.ik_data.qpos[self.q] = q
+        mujoco.mj_kinematics(self.m, self.ik_data)
+        return self.ik_data.site("tcp").xpos.copy()
+
     def ik(self, target, seed=None):
         q = np.array(seed if seed is not None else [0., -.5, 1., 1., 0.], dtype=float)
         d = self.ik_data
@@ -142,15 +147,22 @@ class Robot:
 OPEN = .80
 CLOSE = -.05
 HOVER = .075
+OBSERVE_Q = np.array([-1.2, 0., 0., 0., 0., OPEN])
 
 
 class PickPlaceTask:
-    def __init__(self, model, data, robot, command, destination, box, event):
+    def __init__(self, model, data, robot, command, destination, box, event, source=None, vision=None):
         self.m, self.d, self.robot = model, data, robot
         self.command, self.box, self.event = command, box, event
         self.object_id = command["object_id"]
         self.destination = np.asarray(destination, dtype=float)
-        self.source = data.body(self.object_id).xpos.copy()
+        self.vision = vision
+        self.source = np.asarray(source).copy() if source is not None else data.body(self.object_id).xpos.copy()
+        self.next_visual_check = 0.
+        self.visual_good = False
+        self.visual_evidence = None
+        self.last_verify_xyz = None
+        self.wrist_checked = set()
         self.cube_geom = model.geom(self.object_id + "_geom").id
         self.fixed_body = model.body("gripper").id
         self.moving_body = model.body("moving_jaw_so101_v1").id
@@ -177,12 +189,17 @@ class PickPlaceTask:
             ("OPEN", [*self.destination[:2], HOVER], OPEN),
             ("VERIFY", [*self.destination[:2], HOVER], OPEN),
         ]
+        if vision:
+            specs.insert(-1, ("OBSERVE", robot.tcp_at(OBSERVE_Q), OPEN))
+            specs[-1] = ("VERIFY", robot.tcp_at(OBSERVE_Q), OPEN)
         previous_q = data.ctrl[robot.a].copy()
         rotation = data.body("gripper").xmat.reshape(3, 3)
         previous_xyz = data.site("tcp").xpos.copy() if np.linalg.norm(rotation[:, 2] - [0, 0, 1]) < .02 else None
         for name, xyz, aperture in specs:
             xyz = np.asarray(xyz)
-            if previous_xyz is None:
+            if vision and name in ("OBSERVE", "VERIFY"):
+                points = np.array([previous_q, OBSERVE_Q])
+            elif previous_xyz is None:
                 points = np.array([previous_q, np.r_[robot.ik(xyz), aperture]])
             else:
                 points = []
@@ -216,8 +233,13 @@ class PickPlaceTask:
         return fixed, moving, support
 
     def details(self):
-        cube = self.d.body(self.object_id).xpos.copy()
         fixed, moving, support = self.contacts()
+        if self.vision:
+            return dict(object_id=self.object_id, source_xyz_m=np.round(self.source, 5).tolist(),
+                        destination_xyz_m=np.round(self.destination, 5).tolist(),
+                        fixed_contact=fixed, moving_contact=moving, support_contact=support,
+                        tcp_lift_m=round(self.max_lift, 5), visual_evidence=self.visual_evidence)
+        cube = self.d.body(self.object_id).xpos.copy()
         return dict(object_id=self.object_id, cube_xyz_m=np.round(cube, 5).tolist(),
                     destination_xyz_m=np.round(self.destination, 5).tolist(),
                     target_error_xy_m=round(float(np.linalg.norm(cube[:2] - self.destination[:2])), 5),
@@ -236,7 +258,9 @@ class PickPlaceTask:
     def fail(self, code, reason):
         self.failed = True
         self.reason = code
-        self.event(self.command["id"], "FAIL", phase=self.phase, error=code, reason=reason, details=self.details())
+        recoverable = self.vision is not None and code == "PREGRASP_VISION"
+        self.event(self.command["id"], "RUNNING" if recoverable else "FAIL", phase=self.phase,
+                   error=code, reason=reason, recoverable=recoverable, details=self.details())
 
     def tick(self, dt):
         if self.done or self.failed:
@@ -246,11 +270,13 @@ class PickPlaceTask:
             return
         fixed, moving, support = self.contacts()
         held = fixed and moving
-        cube = self.d.body(self.object_id).xpos
-        self.max_lift = max(self.max_lift, float(cube[2] - self.source[2]))
+        cube = None if self.vision else self.d.body(self.object_id).xpos
+        lift = float(self.d.site("tcp").xpos[2] - (self.source[2] + .010)) if self.vision else float(cube[2] - self.source[2])
+        if held or not self.vision:
+            self.max_lift = max(self.max_lift, lift)
         if self.phase == "TRANSFER":
             self.lost_contact = 0. if held else self.lost_contact + dt
-            if self.lost_contact > .25 or cube[2] < self.source[2] + .025:
+            if self.lost_contact > .25 or (not self.vision and cube[2] < self.source[2] + .025):
                 self.fail("OBJECT_LOST", "Object lost during transfer")
                 return
         self.elapsed += dt
@@ -264,18 +290,48 @@ class PickPlaceTask:
         arm_speed = float(np.max(np.abs(self.d.qvel[self.robot.v[:5]])))
         tcp_error = float(np.linalg.norm(self.d.site("tcp").xpos - self.xyz))
         ready = self.elapsed >= self.duration and arm_error < .03 and arm_speed < .10 and tcp_error < .004
+        if self.vision and self.phase in ("APPROACH", "DESCEND") and ready and self.phase not in self.wrist_checked:
+            try:
+                self.visual_evidence = self.vision.wrist_confirm(self.d, self.object_id, self.source)
+                self.wrist_checked.add(self.phase)
+            except ValueError as exc:
+                self.fail("PREGRASP_VISION" if self.phase == "APPROACH" else "FINAL_GRASP_CHECK", str(exc))
+                return
         if self.phase in ("APPROACH", "DESCEND", "RELEASE", "RETREAT", "OPEN", "VERIFY"):
             ready &= abs(self.d.qpos[self.robot.q[5]] - target[5]) < .03
-        if self.phase == "DESCEND":
+        if self.phase == "DESCEND" and not self.vision:
             ready &= np.linalg.norm(cube[:2] - self.source[:2]) < .008
         if self.phase == "GRASP":
             ready &= held
         if self.phase in ("LIFT", "TRANSFER"):
-            ready &= held and cube[2] - self.source[2] > .035
-            ready &= np.linalg.norm(cube[:2] - self.xyz[:2]) < .01
+            ready &= held and lift > .035
+            if not self.vision:
+                ready &= np.linalg.norm(cube[:2] - self.xyz[:2]) < .01
         if self.phase == "LOWER":
-            ready &= held and abs(cube[2] - (self.destination[2] + HALF)) < .005
-        if self.phase == "VERIFY":
+            ready &= held
+            if not self.vision:
+                ready &= abs(cube[2] - (self.destination[2] + HALF)) < .005
+        if self.phase == "VERIFY" and self.vision:
+            if self.d.time >= self.next_visual_check:
+                self.next_visual_check = self.d.time + .2
+                try:
+                    objects, boxes = self.vision.scan(self.d)
+                    point = objects[self.object_id]["xyz"]
+                    good = np.linalg.norm(point[:2] - self.destination[:2]) < .012
+                    if self.box:
+                        box_xy = boxes[self.command["target_id"]]["xyz"][:2]
+                        good &= np.all(np.abs(point[:2] - box_xy) + HALF < np.array(BOX_INNER) - .001)
+                    good &= self.last_verify_xyz is not None and np.linalg.norm(point - self.last_verify_xyz) < .003
+                    self.last_verify_xyz = point.copy()
+                    self.visual_good = bool(good)
+                    self.visual_evidence = {"camera": "overhead_cam", "stamp": self.vision.stamp,
+                                            "cube_xyz_m": np.round(point, 5).tolist(), "inside_target": bool(good)}
+                except ValueError as exc:
+                    self.visual_good = False
+                    self.last_verify_xyz = None
+                    self.visual_evidence = {"error": str(exc)}
+            ready &= self.visual_good and self.lift_verified and support and not fixed and not moving
+        elif self.phase == "VERIFY":
             velocity = self.d.qvel[self.cube_v:self.cube_v + 6]
             ready &= self.lift_verified and support and not fixed and not moving
             ready &= np.linalg.norm(cube[:2] - self.destination[:2]) < .012
@@ -363,3 +419,171 @@ class TaskManager:
 def queue_demo(hub, prefix="demo"):
     for number, obj, box in ((1, "red_cube", "left_box"), (2, "blue_cube", "right_box"), (3, "yellow_cube", "left_box")):
         hub.submit({"id": f"{prefix}-{number}", "action": "pick_place", "object_id": obj, "target_id": box})
+
+
+class ObserveMotion:
+    """Empty gripper moves to a known observation pose using joint feedback."""
+    def __init__(self, data, robot, command):
+        self.d, self.robot, self.command = data, robot, command
+        self.start = data.ctrl[robot.a].copy()
+        self.duration = max(2., 1.5 * np.max(np.abs(OBSERVE_Q - self.start)) / .30)
+        self.elapsed = self.stable = 0.
+        self.done = self.failed = False
+        self.reason = ""
+        self.phase = "OBSERVE"
+
+    def tick(self, dt):
+        if not np.all(np.isfinite(self.d.qpos)) or not np.all(np.isfinite(self.d.qvel)):
+            self.failed, self.reason = True, "NUMERICAL_ERROR"
+            return
+        self.elapsed += dt
+        u = min(1., self.elapsed / self.duration)
+        self.d.ctrl[self.robot.a] = self.start + (3*u*u - 2*u*u*u) * (OBSERVE_Q - self.start)
+        ready = (u == 1 and np.max(np.abs(self.d.qpos[self.robot.q] - OBSERVE_Q)) < .03
+                 and np.max(np.abs(self.d.qvel[self.robot.v])) < .1)
+        self.stable = self.stable + dt if ready else 0.
+        self.done = self.stable >= .35
+        if not self.done and self.elapsed > self.duration + 5:
+            self.failed, self.reason = True, "OBSERVE_MOTION_TIMEOUT"
+
+
+class VisualTaskManager:
+    """Image-based task dispatch with bounded pre-grasp reobservation.
+
+    Object and box coordinates come exclusively from VisionSystem. Joint/TCP
+    feedback and jaw/support contacts remain simulator sensor adapters.
+    """
+    def __init__(self, model, data, objects, boxes, hub, vision):
+        self.m, self.d, self.hub, self.vision = model, data, hub, vision
+        self.robot = Robot(model)
+        self.active = None
+        self.attempt = 0
+        self.started = self.scan_deadline = self.next_scan = 0.
+        self.last_scan_error = ""
+        self.scan_previous = None
+        self.scan_stable = 0
+
+    def observe(self, command):
+        self.active = ObserveMotion(self.d, self.robot, command)
+        self.scan_deadline = 0.
+        self.scan_previous = None
+        self.scan_stable = 0
+        self.hub.event(command["id"], "RUNNING", phase="OBSERVE", attempt=self.attempt)
+
+    def supported(self, object_id, support_name):
+        pair = {self.m.geom(object_id + "_geom").id, self.m.geom(support_name).id}
+        force = np.zeros(6)
+        for i, contact in enumerate(self.d.contact):
+            if {contact.geom1, contact.geom2} == pair and contact.efc_address >= 0:
+                mujoco.mj_contactForce(self.m, self.d, i, force)
+                if force[0] > .005:
+                    return True
+        return False
+
+    def destination(self, command, objects, boxes):
+        if "target_xyz" in command:
+            point = np.array(command["target_xyz"], dtype=float)
+            if any(np.all(np.abs(point[:2] - b["xyz"][:2]) < [.08, .06]) for b in boxes.values()):
+                raise ValueError("TARGET_BLOCKED: use target_id for boxes")
+            if any(n != command["object_id"] and np.linalg.norm(o["xyz"][:2] - point[:2]) < .045
+                   for n, o in objects.items()):
+                raise ValueError("TARGET_OCCUPIED")
+            return point, None
+        box = boxes[command["target_id"]]
+        for offset in (-.022, .022):
+            point = box["xyz"].copy()
+            point[0] += offset
+            if not any(n != command["object_id"] and np.linalg.norm(o["xyz"][:2] - point[:2]) < .037
+                       for n, o in objects.items()):
+                return point, {"xy": box["xyz"][:2].copy()}
+        raise ValueError("BOX_FULL")
+
+    def plan_from_images(self, command):
+        objects, boxes = self.vision.scan(self.d)
+        points = np.array([x["xyz"] for x in (*objects.values(), *boxes.values())])
+        stable = self.scan_previous is not None and np.max(np.abs(points - self.scan_previous)) < .003
+        self.scan_stable = self.scan_stable + 1 if stable else 1
+        self.scan_previous = points
+        if self.scan_stable < 3:
+            raise ValueError("OBSERVATION_SETTLING: require three consistent RGB observations")
+        source = objects[command["object_id"]]["xyz"]
+        containing = [n for n, b in boxes.items() if np.all(np.abs(source[:2] - b["xyz"][:2]) + HALF
+                                                           < np.array(BOX_INNER) - .001)]
+        support_name = containing[0] + "_bottom" if containing else "floor"
+        if not self.supported(command["object_id"], support_name):
+            raise ValueError("OBJECT_NOT_SUPPORTED: known-plane localization requires a resting object")
+        if "target_id" in command:
+            inside = np.all(np.abs(source[:2] - boxes[command["target_id"]]["xyz"][:2]) + HALF
+                            < np.array(BOX_INNER) - .001)
+            if inside:
+                self.hub.event(command["id"], "SUCCESS", phase="ALREADY_PLACED",
+                               perception=self.vision.telemetry())
+                self.active = None
+                return
+        point, box = self.destination(command, objects, boxes)
+        self.hub.event(command["id"], "PLANNING", source="rgb_plane_geometry",
+                       source_xyz_m=source.tolist(), destination_xyz_m=point.tolist(),
+                       image_stamp=self.vision.stamp, attempt=self.attempt)
+        self.active = PickPlaceTask(self.m, self.d, self.robot, command, point, box,
+                                    self.hub.event, source=source, vision=self.vision)
+
+    def tick(self, dt):
+        if self.active:
+            task = self.active
+            if self.d.time - self.started > 100.:
+                self.hub.event(task.command["id"], "FAIL", error="TASK_TIME_BUDGET", phase=task.phase)
+                self.hub.latch_fault("TASK_TIME_BUDGET")
+                self.active = None
+            elif isinstance(task, ObserveMotion):
+                task.tick(dt)
+                if task.failed:
+                    self.hub.event(task.command["id"], "FAIL", error=task.reason, phase=task.phase)
+                    self.hub.latch_fault(task.reason)
+                    self.active = None
+                elif task.done:
+                    if not self.scan_deadline:
+                        self.scan_deadline = self.d.time + 2.
+                        self.next_scan = self.d.time
+                        task.phase = "LOCALIZE"
+                    if self.d.time >= self.next_scan:
+                        self.next_scan = self.d.time + .2
+                        try:
+                            self.plan_from_images(task.command)
+                        except ValueError as exc:
+                            self.last_scan_error = str(exc)
+                            if self.d.time >= self.scan_deadline:
+                                self.hub.event(task.command["id"], "FAIL", phase="LOCALIZE",
+                                               error="PERCEPTION_OR_PLAN_REJECTED", reason=str(exc),
+                                               recovery="Inspect scene or provide a new command")
+                                self.active = None
+            else:
+                task.tick(dt)
+                if task.failed:
+                    if task.reason == "PREGRASP_VISION" and self.attempt < 2:
+                        self.attempt += 1
+                        self.observe(task.command)
+                    else:
+                        if task.reason == "PREGRASP_VISION":
+                            self.hub.event(task.command["id"], "FAIL", error="RELOCALIZE_EXHAUSTED",
+                                           phase=task.phase, attempts=self.attempt + 1)
+                        self.hub.latch_fault(task.reason)
+                        self.active = None
+                elif task.done:
+                    self.hub.event(task.command["id"], "SUCCESS", phase="DONE", details=task.details())
+                    self.active = None
+        elif self.hub.fault is None:
+            command = self.hub.pop()
+            if command:
+                self.attempt = 0
+                self.started = self.d.time
+                self.observe(command)
+        with self.hub.lock:
+            perception = self.vision.telemetry()
+            self.hub.telemetry = {"sim_time": round(self.d.time, 3),
+                                  "active_id": self.active.command["id"] if self.active else None,
+                                  "phase": self.active.phase if self.active else "IDLE",
+                                  "objects": perception["objects"], "perception": perception,
+                                  "bins": {box: [name for name, obj in self.vision.objects.items()
+                                                 if np.all(np.abs(obj["xyz"][:2] - b["xyz"][:2]) + HALF
+                                                           < np.array(BOX_INNER) - .001)]
+                                           for box, b in self.vision.boxes.items()}}
